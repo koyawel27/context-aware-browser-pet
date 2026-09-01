@@ -97,10 +97,13 @@ let isOrphaned = false;
 let privacyConsentAccepted = false;
 
 async function readPrivacyConsent(): Promise<boolean> {
-  const data = await extensionApi.storage.local
-    .get<Record<string, boolean | undefined>>(STORAGE_KEYS.CONSENT)
-    .catch(() => ({}));
-  return data[STORAGE_KEYS.CONSENT] === true;
+  try {
+    const data = await extensionApi.storage.local
+      .get<Record<string, boolean | undefined>>(STORAGE_KEYS.CONSENT);
+    return data[STORAGE_KEYS.CONSENT] === true;
+  } catch {
+    return false;
+  }
 }
 
 function cleanupOrphanedScript(reason = "Browser Pet: Old extension context invalidated. Injected mascot cleaned up."): void {
