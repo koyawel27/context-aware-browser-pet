@@ -1,4 +1,5 @@
 export const STORAGE_KEYS = {
+  CONSENT: 'consentAccepted',
   SETTINGS: 'pet-settings',
   STATS: 'pet-stats',
   MOOD: 'pet-mood',

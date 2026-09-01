@@ -20,7 +20,7 @@ setBridgeToken(BRIDGE_TOKEN);
 
 let currentSettings: PetSettings = { size: 128, speed: 1.2, aiMode: false, apiKey: '', soundEnabled: true, soundVolume: 0.5, scheduleEnabled: true };
 
-(function injectMainWorld() {
+function injectMainWorld(): void {
   try {
     if (!extensionApi.runtime.id) return;
     if (window !== window.top) return;
@@ -33,7 +33,7 @@ let currentSettings: PetSettings = { size: 128, speed: 1.2, aiMode: false, apiKe
   } catch (e) {
     console.warn(`[${currentSettings.name || "Arcrawls"} Content] Main world injection failed:`, e);
   }
-})();
+}
 
 let idleTimer: ReturnType<typeof setTimeout> | null = null;
 let debounceTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -94,8 +94,19 @@ async function playSound(type: string): Promise<void> {
 }
 
 let isOrphaned = false;
+let privacyConsentAccepted = false;
 
-function cleanupOrphanedScript(): void {
+async function readPrivacyConsent(): Promise<boolean> {
+  try {
+    const data = await extensionApi.storage.local
+      .get<Record<string, boolean | undefined>>(STORAGE_KEYS.CONSENT);
+    return data[STORAGE_KEYS.CONSENT] === true;
+  } catch {
+    return false;
+  }
+}
+
+function cleanupOrphanedScript(reason = "Browser Pet: Old extension context invalidated. Injected mascot cleaned up."): void {
   if (isOrphaned) return;
   isOrphaned = true;
 
@@ -140,7 +151,7 @@ function cleanupOrphanedScript(): void {
     extensionApi.runtime.onMessage?.removeListener(handleRuntimeMessage);
   } catch (e) { /* ignore */ }
 
-  console.log("Browser Pet: Old extension context invalidated. Injected mascot cleaned up.");
+  console.log(reason);
 }
 
 function checkContextOrCleanup(): boolean {
@@ -1172,9 +1183,6 @@ function handleDrop(e: DragEvent) {
   }
 }
 
-window.addEventListener('dragover', handleDragOver);
-window.addEventListener('drop', handleDrop);
-
 async function loadAndApplySettings(): Promise<void> {
   if (!checkContextOrCleanup()) return;
   try {
@@ -1202,12 +1210,17 @@ async function loadAndApplySettings(): Promise<void> {
 
 function handleStorageChanged(changes: Record<string, StorageChange>) {
   if (!checkContextOrCleanup()) return;
-  if (changes['consentAccepted']) {
-    const accepted = changes['consentAccepted'].newValue;
-    if (accepted && !isInitialized) {
-      if (document.visibilityState === 'visible') {
-        actuallyInit();
+  if (changes[STORAGE_KEYS.CONSENT]) {
+    const accepted = changes[STORAGE_KEYS.CONSENT].newValue === true;
+    privacyConsentAccepted = accepted;
+    if (!accepted) {
+      if (isInitialized) {
+        cleanupOrphanedScript("Browser Pet: Privacy consent was removed. Injected mascot cleaned up.");
       }
+      return;
+    }
+    if (!isInitialized && document.visibilityState === 'visible') {
+      actuallyInit();
     }
   }
   if (changes[STORAGE_KEYS.SETTINGS]) {
@@ -1401,7 +1414,7 @@ function handleVisibilityChange() {
 
 function handleWindowFocus() {
   if (!checkContextOrCleanup()) return;
-  if (isPetHidden()) return;
+  if (!isInitialized || isPetHidden()) return;
   resetIdleTimer();
   debouncedUpdateEmotion(100);
 }
@@ -1439,11 +1452,9 @@ async function init(): Promise<void> {
 
   if (!checkContextOrCleanup()) return;
 
-  const savedConsent = await extensionApi.storage.local.get<{ consentAccepted?: boolean }>('consentAccepted').catch(() => ({ consentAccepted: false }));
-  const settingsExist = await extensionApi.storage.local.get<Record<string, any>>(STORAGE_KEYS.SETTINGS).then(data => !!data[STORAGE_KEYS.SETTINGS]).catch(() => false);
-  const consentAccepted = !!(savedConsent.consentAccepted || settingsExist);
+  privacyConsentAccepted = await readPrivacyConsent();
 
-  if (!consentAccepted) {
+  if (!privacyConsentAccepted) {
     console.log(`[${currentSettings.name || "Arcrawls"} Content] User has not accepted privacy consent yet. Mascot is disabled.`);
     return;
   }
@@ -1458,7 +1469,18 @@ async function init(): Promise<void> {
 
 async function actuallyInit(): Promise<void> {
   if (isInitialized || isOrphaned) return;
+
+  if (!privacyConsentAccepted) {
+    privacyConsentAccepted = await readPrivacyConsent();
+  }
+  if (!privacyConsentAccepted || isInitialized || isOrphaned) {
+    return;
+  }
+
+  injectMainWorld();
   ensureInitialized();
+  window.addEventListener('dragover', handleDragOver);
+  window.addEventListener('drop', handleDrop);
 
   await personality.isLoaded;
 
