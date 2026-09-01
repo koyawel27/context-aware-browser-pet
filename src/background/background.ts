@@ -31,7 +31,7 @@ try {
     }
   }).catch(() => { /* Ignore session storage errors */ });
 } catch (e) { /* Ignore */ }
-const backgroundPersonality = new PersonalitySystem();
+let backgroundPersonality: PersonalitySystem | null = null;
 const supportsOffscreen = supportsOffscreenDocuments();
 const supportsAudioInBackground = typeof Audio !== 'undefined';
 const unsupportedOffscreenMessage = 'Local AI and centralized audio require Chrome offscreen documents and are not available in this Firefox build yet.';
@@ -49,6 +49,82 @@ function applyRuntimeFeatureSupport(settings: any = {}) {
     advancedAiEnabled: false
   };
 }
+
+let privacyConsentAccepted = false;
+let pageMonitoringEnabled = false;
+
+function getBackgroundPersonality(): PersonalitySystem {
+  if (!backgroundPersonality) {
+    backgroundPersonality = new PersonalitySystem();
+  }
+  return backgroundPersonality;
+}
+
+function handleWebRequestCompleted(details: any): void {
+  if (details.statusCode >= 400 && details.frameId === 0) {
+    tabHttpErrors[details.tabId] = details.statusCode;
+    extensionApi.tabs.sendMessage(details.tabId, {
+      type: 'http-error',
+      code: details.statusCode,
+    }).catch(() => {});
+  }
+}
+
+function handleBeforeNavigate(details: any): void {
+  if (details.frameId === 0) delete tabHttpErrors[details.tabId];
+}
+
+function handleNavigationCommitted(details: any): void {
+  if (details.frameId === 0) {
+    extensionApi.tabs.sendMessage(details.tabId, { type: 'navigation' }).catch(() => {});
+  }
+}
+
+function setPageMonitoringEnabled(enabled: boolean): void {
+  if (pageMonitoringEnabled === enabled) return;
+  pageMonitoringEnabled = enabled;
+
+  if (enabled) {
+    extensionApi.webRequest.onCompleted?.addListener(
+      handleWebRequestCompleted,
+      { urls: ['http://*/*', 'https://*/*'], types: ['main_frame'] }
+    );
+    extensionApi.webNavigation.onBeforeNavigate?.addListener(handleBeforeNavigate);
+    extensionApi.webNavigation.onCommitted?.addListener(
+      handleNavigationCommitted,
+      { url: [{ schemes: ['http', 'https'] }] }
+    );
+    return;
+  }
+
+  extensionApi.webRequest.onCompleted?.removeListener(handleWebRequestCompleted);
+  extensionApi.webNavigation.onBeforeNavigate?.removeListener(handleBeforeNavigate);
+  extensionApi.webNavigation.onCommitted?.removeListener(handleNavigationCommitted);
+  Object.keys(tabHttpErrors).forEach((tabId) => delete tabHttpErrors[Number(tabId)]);
+}
+
+function applyPrivacyConsent(accepted: boolean): void {
+  privacyConsentAccepted = accepted;
+  setPageMonitoringEnabled(accepted);
+  if (!accepted) {
+    backgroundPersonality?.destroy();
+    backgroundPersonality = null;
+  }
+  syncOffscreenForCurrentSettings().catch((e) => {
+    console.warn('[Arcrawls Background] Failed to sync consent-gated offscreen state:', e);
+  });
+}
+
+extensionApi.storage.local
+  .get<Record<string, boolean | undefined>>(STORAGE_KEYS.CONSENT)
+  .then((data) => applyPrivacyConsent(data[STORAGE_KEYS.CONSENT] === true))
+  .catch(() => applyPrivacyConsent(false));
+
+extensionApi.storage.onChanged?.addListener((changes) => {
+  if (changes[STORAGE_KEYS.CONSENT]) {
+    applyPrivacyConsent(changes[STORAGE_KEYS.CONSENT].newValue === true);
+  }
+});
 
 extensionApi.runtime.onInstalled?.addListener((details) => {
   if (details.reason === 'install') {
@@ -115,50 +191,19 @@ extensionApi.runtime.onStartup?.addListener(() => {
 
 extensionApi.alarms.onAlarm?.addListener(async (alarm) => {
   if (alarm.name === 'pet-decay') {
+    if (!privacyConsentAccepted) return;
     try {
       const data = await extensionApi.storage.local.get<Record<string, any>>(STORAGE_KEYS.SETTINGS);
-      await backgroundPersonality._periodicDecay(data[STORAGE_KEYS.SETTINGS]);
+      await getBackgroundPersonality()._periodicDecay(data[STORAGE_KEYS.SETTINGS]);
     } catch (e) {
       console.warn('[Arcrawls Background] Failed to apply periodic decay:', e);
     }
   }
 });
 
-extensionApi.webRequest.onCompleted?.addListener(
-  (details) => {
-    if (details.statusCode >= 400 && details.frameId === 0) {
-      tabHttpErrors[details.tabId] = details.statusCode;
-      extensionApi.tabs.sendMessage(details.tabId, {
-        type: 'http-error',
-        code: details.statusCode,
-      }).catch((e) => {
-        // Silently catch to avoid console spam
-      });
-    }
-  },
-  { urls: ['http://*/*', 'https://*/*'], types: ['main_frame'] }
-);
-
 extensionApi.tabs.onRemoved?.addListener((tabId) => {
   delete tabHttpErrors[tabId];
 });
-
-extensionApi.webNavigation.onBeforeNavigate?.addListener((details) => {
-  if (details.frameId === 0) {
-    delete tabHttpErrors[details.tabId];
-  }
-});
-
-extensionApi.webNavigation.onCommitted?.addListener(
-  (details) => {
-    if (details.frameId === 0) {
-      extensionApi.tabs.sendMessage(details.tabId, { type: 'navigation' }).catch((e) => {
-        // Silently catch to avoid console spam
-      });
-    }
-  },
-  { url: [{ schemes: ['http', 'https'] }] }
-);
 
 // Add a simple throttle to prevent dragging from spamming messages
 let lastSyncTime = 0;
@@ -183,7 +228,11 @@ extensionApi.runtime.onMessage?.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === 'record-site-visit') {
-    backgroundPersonality.recordSiteVisit(message.category, message.sentiment).catch(e => {
+    if (!privacyConsentAccepted) {
+      if (sendResponse) sendResponse({ success: false, error: 'Privacy consent is required' });
+      return false;
+    }
+    getBackgroundPersonality().recordSiteVisit(message.category, message.sentiment).catch(e => {
       console.warn('[Arcrawls Background] Failed to record site visit:', e);
     });
     if (sendResponse) sendResponse({ success: true });
@@ -539,30 +588,29 @@ async function closeOffscreen(): Promise<void> {
   }
 }
 
-// Pre-load the offscreen document (which pre-loads the classifier) if AI Mode or Sound is enabled
-extensionApi.storage.local.get<Record<string, any>>(STORAGE_KEYS.SETTINGS).then((data) => {
-  if (!supportsOffscreen) {
-    return;
-  }
+async function syncOffscreenForCurrentSettings(): Promise<void> {
+  if (!supportsOffscreen) return;
 
+  const data = await extensionApi.storage.local.get<Record<string, any>>(STORAGE_KEYS.SETTINGS);
   const settings = data[STORAGE_KEYS.SETTINGS] || {};
-  if ((settings.aiMode && (settings.advancedAiEnabled ?? settings.aiMode)) || settings.soundEnabled) {
-    setupOffscreen().catch((e) => { console.warn('[Arcrawls Background] setupOffscreen initial call error:', e); });
-  }
-}).catch((e) => { console.warn('[Arcrawls Background] Failed to load initial settings:', e); });
+  const needsOffscreen = privacyConsentAccepted
+    && ((settings.aiMode && (settings.advancedAiEnabled ?? settings.aiMode)) || settings.soundEnabled);
 
-// Watch for settings changes to boot offscreen context in real time
+  if (needsOffscreen) {
+    await setupOffscreen();
+  } else {
+    await closeOffscreen();
+  }
+}
+
+syncOffscreenForCurrentSettings().catch((e) => {
+  console.warn('[Arcrawls Background] Failed to sync initial offscreen state:', e);
+});
+
 extensionApi.storage.onChanged?.addListener((changes) => {
-  if (!supportsOffscreen) {
-    return;
-  }
-
   if (changes[STORAGE_KEYS.SETTINGS]) {
-    const settings = changes[STORAGE_KEYS.SETTINGS].newValue || {};
-    if ((settings.aiMode && (settings.advancedAiEnabled ?? settings.aiMode)) || settings.soundEnabled) {
-      setupOffscreen().catch((e) => { console.warn('[Arcrawls Background] setupOffscreen re-call error:', e); });
-    } else {
-      closeOffscreen().catch((e) => { console.warn('[Arcrawls Background] closeOffscreen re-call error:', e); });
-    }
+    syncOffscreenForCurrentSettings().catch((e) => {
+      console.warn('[Arcrawls Background] Failed to sync offscreen state:', e);
+    });
   }
 });

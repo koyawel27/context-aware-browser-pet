@@ -25,8 +25,8 @@ extensionApi.storage.local.get<Record<string, any>>(STORAGE_KEYS.SETTINGS).then(
   const consentCheckbox = document.getElementById('consent-checkbox') as HTMLInputElement | null;
 
   let isConsented = false;
-  extensionApi.storage.local.get<{ consentAccepted?: boolean }>('consentAccepted').then((data) => {
-    if (data && data.consentAccepted) {
+  extensionApi.storage.local.get<Record<string, boolean | undefined>>(STORAGE_KEYS.CONSENT).then((data) => {
+    if (data?.[STORAGE_KEYS.CONSENT] === true) {
       isConsented = true;
       if (consentCheckbox) consentCheckbox.checked = true;
     }
@@ -82,7 +82,7 @@ extensionApi.storage.local.get<Record<string, any>>(STORAGE_KEYS.SETTINGS).then(
   btnNext.addEventListener('click', () => {
     if (currentStep === TOTAL_STEPS - 1) {
       // Save consent to storage
-      extensionApi.storage.local.set({ consentAccepted: true }).then(() => {
+      extensionApi.storage.local.set({ [STORAGE_KEYS.CONSENT]: true }).then(() => {
         window.close();
       }).catch(() => {
         window.close();
