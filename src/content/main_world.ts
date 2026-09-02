@@ -3,21 +3,67 @@
 const currentScript = document.currentScript as HTMLScriptElement;
 const BRIDGE_TOKEN = currentScript?.dataset.token;
 
-window.addEventListener('error', (event) => {
-  window.postMessage({ type: 'PET_PAGE_ERROR', message: event.message, token: BRIDGE_TOKEN }, '*');
-});
+let bridgeActive = true;
+const activeSessions = new Set<any>();
 
-window.addEventListener('unhandledrejection', (event) => {
-  window.postMessage({ type: 'PET_PAGE_ERROR', message: event.reason?.message || 'Unhandled rejection', token: BRIDGE_TOKEN }, '*');
-});
+function postBridgeMessage(message: Record<string, unknown>): void {
+  if (!bridgeActive) return;
+  window.postMessage({ ...message, token: BRIDGE_TOKEN }, '*');
+}
 
-window.addEventListener('message', async (event) => {
+async function closeSession(session: any): Promise<void> {
+  if (!session) return;
+
+  try {
+    if (typeof session.destroy === 'function') {
+      await session.destroy();
+    } else if (typeof session.close === 'function') {
+      await session.close();
+    }
+  } catch (err) {
+    console.warn('[Arcrawls Main World] Failed to close local AI session:', err);
+  }
+}
+
+function handlePageError(event: ErrorEvent): void {
+  postBridgeMessage({ type: 'PET_PAGE_ERROR', message: event.message });
+}
+
+function handleUnhandledRejection(event: PromiseRejectionEvent): void {
+  postBridgeMessage({
+    type: 'PET_PAGE_ERROR',
+    message: event.reason?.message || 'Unhandled rejection'
+  });
+}
+
+function shutdownBridge(): void {
+  if (!bridgeActive) return;
+  bridgeActive = false;
+
+  window.removeEventListener('error', handlePageError);
+  window.removeEventListener('unhandledrejection', handleUnhandledRejection);
+  window.removeEventListener('message', handleMessage);
+
+  for (const session of activeSessions) {
+    activeSessions.delete(session);
+    void closeSession(session);
+  }
+}
+
+async function handleMessage(event: MessageEvent): Promise<void> {
   if (event.source !== window || !event.data || event.data.token !== BRIDGE_TOKEN) return;
+
+  if (event.data.type === 'PET_BRIDGE_SHUTDOWN') {
+    shutdownBridge();
+    return;
+  }
+
+  if (!bridgeActive) return;
 
   if (event.data.type === 'PET_AI_AVAILABILITY_CHECK_REQUEST') {
     const lm = (globalThis as any).ai?.languageModel || (globalThis as any).LanguageModel || (window as any).ai?.languageModel || (window as any).LanguageModel;
     let availability = 'unavailable';
-    
+
     if (lm) {
       try {
         if (typeof lm.availability === 'function') {
@@ -30,62 +76,100 @@ window.addEventListener('message', async (event) => {
         console.error('[Arcrawls Local AI] Availability check failed:', e);
       }
     }
-    
-    // In the new API, availability is "unavailable" | "downloadable" | "downloading" | "available"
-    window.postMessage({ type: 'PET_AI_AVAILABILITY_CHECK_RESPONSE', id: event.data.id, availability, token: BRIDGE_TOKEN }, '*');
+
+    if (!bridgeActive) return;
+
+    postBridgeMessage({
+      type: 'PET_AI_AVAILABILITY_CHECK_RESPONSE',
+      id: event.data.id,
+      availability
+    });
+    return;
   }
 
-  if (event.data.type === 'PET_AI_PROMPT_REQUEST') {
-    const { id, systemPrompt, prompt } = event.data;
-    const lm = (globalThis as any).ai?.languageModel || (globalThis as any).LanguageModel || (window as any).ai?.languageModel || (window as any).LanguageModel;
+  if (event.data.type !== 'PET_AI_PROMPT_REQUEST') return;
 
-    if (!lm) {
-      window.postMessage({ type: 'PET_AI_PROMPT_RESPONSE', id, error: 'built-in Prompt API (LanguageModel) is not defined in this context', token: BRIDGE_TOKEN }, '*');
+  const { id, systemPrompt, prompt } = event.data;
+  const lm = (globalThis as any).ai?.languageModel || (globalThis as any).LanguageModel || (window as any).ai?.languageModel || (window as any).LanguageModel;
+
+  if (!lm) {
+    postBridgeMessage({
+      type: 'PET_AI_PROMPT_RESPONSE',
+      id,
+      error: 'built-in Prompt API (LanguageModel) is not defined in this context'
+    });
+    return;
+  }
+
+  let session: any = null;
+
+  try {
+    let availability = 'unavailable';
+    if (typeof lm.availability === 'function') {
+      availability = await lm.availability();
+    } else if (typeof lm.capabilities === 'function') {
+      const caps = await lm.capabilities({ expectedOutputs: [{ type: 'text', languages: ['en'] }] });
+      availability = caps.available;
+    }
+
+    if (!bridgeActive) return;
+
+    if (availability !== 'available' && availability !== 'downloadable' && availability !== 'downloading') {
+      postBridgeMessage({
+        type: 'PET_AI_PROMPT_RESPONSE',
+        id,
+        error: 'Gemini Nano model is not ready: ' + availability
+      });
       return;
     }
 
-    let session: any = null;
-    try {
-      let availability = 'unavailable';
-      if (typeof lm.availability === 'function') {
-        availability = await lm.availability();
-      } else if (typeof lm.capabilities === 'function') {
-        const caps = await lm.capabilities({ expectedOutputs: [{ type: 'text', languages: ['en'] }] });
-        availability = caps.available;
-      }
+    const createOptions: any = {
+      expectedOutputs: [{ type: 'text', languages: ['en'] }]
+    };
 
-      if (availability !== 'available' && availability !== 'downloadable' && availability !== 'downloading') {
-        window.postMessage({ type: 'PET_AI_PROMPT_RESPONSE', id, error: 'Gemini Nano model is not ready: ' + availability, token: BRIDGE_TOKEN }, '*');
-        return;
-      }
+    if (systemPrompt) {
+      createOptions.systemPrompt = systemPrompt;
+      createOptions.initialPrompts = [{ role: 'system', content: systemPrompt }];
+    }
 
-      const createOptions: any = {
-        expectedOutputs: [{ type: 'text', languages: ['en'] }]
-      };
-      if (systemPrompt) {
-        createOptions.systemPrompt = systemPrompt;
-        createOptions.initialPrompts = [{ role: 'system', content: systemPrompt }];
-      }
+    console.log('[Arcrawls AI] Executing local Gemini Nano inference (MAIN_WORLD)...');
+    session = await lm.create(createOptions);
 
-      console.log('[Arcrawls AI] Executing local Gemini Nano inference (MAIN_WORLD)...');
-      session = await lm.create(createOptions);
+    if (!bridgeActive) {
+      await closeSession(session);
+      session = null;
+      return;
+    }
 
-      const resultText = await session.prompt(prompt);
-      window.postMessage({ type: 'PET_AI_PROMPT_RESPONSE', id, resultText, token: BRIDGE_TOKEN }, '*');
+    activeSessions.add(session);
 
-    } catch (error: any) {
-      window.postMessage({ type: 'PET_AI_PROMPT_RESPONSE', id, error: error.message || String(error), token: BRIDGE_TOKEN }, '*');
-    } finally {
-      if (session) {
-        try {
-          if (typeof session.destroy === 'function') {
-            await session.destroy();
-          } else if (typeof session.close === 'function') {
-            await session.close();
-          }
-        } catch (err) { console.warn('[Arcrawls Main World] WAAPI cancellation error:', err); }
-      }
+    const resultText = await session.prompt(prompt);
+
+    if (!bridgeActive) return;
+
+    postBridgeMessage({
+      type: 'PET_AI_PROMPT_RESPONSE',
+      id,
+      resultText
+    });
+
+  } catch (error: any) {
+    if (!bridgeActive) return;
+
+    postBridgeMessage({
+      type: 'PET_AI_PROMPT_RESPONSE',
+      id,
+      error: error?.message || String(error)
+    });
+  } finally {
+    if (session) {
+      activeSessions.delete(session);
+      await closeSession(session);
     }
   }
-});
+}
+
+window.addEventListener('error', handlePageError);
+window.addEventListener('unhandledrejection', handleUnhandledRejection);
+window.addEventListener('message', handleMessage);
 })();
