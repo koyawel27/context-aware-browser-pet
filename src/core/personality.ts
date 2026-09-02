@@ -1,4 +1,4 @@
-import { PetStats, PetSettings } from '../shared/types';
+import { PetStats, PetSettings, StorageChange } from '../shared/types';
 import { STORAGE_KEYS } from '../shared/constants';
 import { getDominantTrait } from './rules';
 import { isSleeping, isYogaTime } from './schedule';
@@ -35,19 +35,25 @@ export class PersonalitySystem {
   disabledEmotions: string[] = [];
   private _decayInterval: ReturnType<typeof setInterval> | null = null;
 
+  private _handleStorageChanged = (
+    changes: Record<string, StorageChange>
+  ): void => {
+    if (changes[STORAGE_KEYS.STATS]) {
+      const newVal = changes[STORAGE_KEYS.STATS].newValue;
+      if (newVal) {
+        this.stats = newVal;
+      }
+    }
+  };
+
   constructor(onStatsChange?: (stats: PetStats) => void) {
     this.stats = { ...DEFAULT_STATS };
     this.onStatsChange = onStatsChange;
     this.isLoaded = this._load();
 
-    extensionApi.storage.onChanged?.addListener((changes) => {
-      if (changes[STORAGE_KEYS.STATS]) {
-        const newVal = changes[STORAGE_KEYS.STATS].newValue;
-        if (newVal) {
-          this.stats = newVal;
-        }
-      }
-    });
+    extensionApi.storage.onChanged?.addListener(
+      this._handleStorageChanged
+    );
   }
 
   _applyDecay(settings?: PetSettings): void {
@@ -413,6 +419,14 @@ export class PersonalitySystem {
     if (this._decayInterval) {
       clearInterval(this._decayInterval);
       this._decayInterval = null;
+    }
+
+    try {
+      extensionApi.storage.onChanged?.removeListener(
+        this._handleStorageChanged
+      );
+    } catch {
+      // Ignore cleanup errors if the extension context is already invalid.
     }
   }
 }

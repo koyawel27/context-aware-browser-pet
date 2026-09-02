@@ -154,6 +154,9 @@ export class MovementEngine {
   }
 
   stop(): void {
+    this._stopPosAnimation();
+    this.paused = true;
+
     if (this._raf) {
       cancelAnimationFrame(this._raf);
       this._raf = null;
