@@ -23,6 +23,35 @@ extensionApi.storage.local.get<Record<string, any>>(STORAGE_KEYS.SHARED_STATE).t
 let originPetStates: Record<string, OriginPetState> = {};
 const tabHttpErrors: Record<number, number> = {};
 
+type TabPrivacyState = 'normal' | 'protected';
+
+const tabPrivacyStates = new Map<number, TabPrivacyState>();
+
+function setTabPrivacyState(
+  tabId: number,
+  state: TabPrivacyState
+): void {
+  tabPrivacyStates.set(tabId, state);
+
+  if (state !== 'normal') {
+    delete tabHttpErrors[tabId];
+  }
+}
+
+function markTabPrivacyUnknown(tabId: number): void {
+  tabPrivacyStates.delete(tabId);
+  delete tabHttpErrors[tabId];
+}
+
+function isTabConfirmedNormal(
+  tabId: number | undefined
+): boolean {
+  return (
+    tabId !== undefined &&
+    tabPrivacyStates.get(tabId) === 'normal'
+  );
+}
+
 // Load origin states from session storage to survive Service Worker suspension
 try {
   extensionApi.storage.session?.get<Record<string, any>>('originPetStates').then((data) => {
@@ -61,7 +90,11 @@ function getBackgroundPersonality(): PersonalitySystem {
 }
 
 function handleWebRequestCompleted(details: any): void {
-  if (details.statusCode >= 400 && details.frameId === 0) {
+  if (
+    details.statusCode >= 400 &&
+    details.frameId === 0 &&
+    isTabConfirmedNormal(details.tabId)
+  ) {
     tabHttpErrors[details.tabId] = details.statusCode;
     extensionApi.tabs.sendMessage(details.tabId, {
       type: 'http-error',
@@ -71,12 +104,28 @@ function handleWebRequestCompleted(details: any): void {
 }
 
 function handleBeforeNavigate(details: any): void {
-  if (details.frameId === 0) delete tabHttpErrors[details.tabId];
+  if (details.frameId === 0) {
+    markTabPrivacyUnknown(details.tabId);
+  }
 }
 
 function handleNavigationCommitted(details: any): void {
   if (details.frameId === 0) {
-    extensionApi.tabs.sendMessage(details.tabId, { type: 'navigation' }).catch(() => {});
+    markTabPrivacyUnknown(details.tabId);
+
+    extensionApi.tabs
+      .sendMessage(details.tabId, { type: 'navigation' })
+      .catch(() => {});
+  }
+}
+
+function handleHistoryStateUpdated(details: any): void {
+  if (details.frameId === 0) {
+    markTabPrivacyUnknown(details.tabId);
+
+    extensionApi.tabs
+      .sendMessage(details.tabId, { type: 'navigation' })
+      .catch(() => {});
   }
 }
 
@@ -94,13 +143,20 @@ function setPageMonitoringEnabled(enabled: boolean): void {
       handleNavigationCommitted,
       { url: [{ schemes: ['http', 'https'] }] }
     );
+    extensionApi.webNavigation.onHistoryStateUpdated?.addListener(
+      handleHistoryStateUpdated,
+      { url: [{ schemes: ['http', 'https'] }] }
+    );
     return;
   }
 
   extensionApi.webRequest.onCompleted?.removeListener(handleWebRequestCompleted);
   extensionApi.webNavigation.onBeforeNavigate?.removeListener(handleBeforeNavigate);
   extensionApi.webNavigation.onCommitted?.removeListener(handleNavigationCommitted);
+  extensionApi.webNavigation.onHistoryStateUpdated?.removeListener(handleHistoryStateUpdated);
+
   Object.keys(tabHttpErrors).forEach((tabId) => delete tabHttpErrors[Number(tabId)]);
+  tabPrivacyStates.clear();
 }
 
 function applyPrivacyConsent(accepted: boolean): void {
@@ -203,6 +259,7 @@ extensionApi.alarms.onAlarm?.addListener(async (alarm) => {
 
 extensionApi.tabs.onRemoved?.addListener((tabId) => {
   delete tabHttpErrors[tabId];
+  tabPrivacyStates.delete(tabId);
 });
 
 // Add a simple throttle to prevent dragging from spamming messages
@@ -227,11 +284,57 @@ extensionApi.runtime.onMessage?.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  if (message.type === 'record-site-visit') {
-    if (!privacyConsentAccepted) {
-      if (sendResponse) sendResponse({ success: false, error: 'Privacy consent is required' });
+  if (message.type === 'privacy-state') {
+    const tabId = sender.tab?.id;
+
+    if (
+      !privacyConsentAccepted ||
+      tabId === undefined ||
+      (sender.frameId ?? 0) !== 0 ||
+      (
+        message.state !== 'normal' &&
+        message.state !== 'protected'
+      )
+    ) {
+      if (tabId !== undefined) {
+        markTabPrivacyUnknown(tabId);
+      }
+
+      sendResponse({
+        success: false,
+        error: 'Invalid or unavailable privacy state'
+      });
       return false;
     }
+
+    setTabPrivacyState(
+      tabId,
+      message.state
+    );
+
+    sendResponse({ success: true });
+    return false;
+  }
+
+  if (message.type === 'record-site-visit') {
+    if (!privacyConsentAccepted) {
+      if (sendResponse) sendResponse({
+        success: false,
+        error: 'Privacy consent is required'
+      });
+      return false;
+    }
+
+    const tabId = sender.tab?.id;
+
+    if (!isTabConfirmedNormal(tabId)) {
+      if (sendResponse) sendResponse({
+        success: false,
+        error: 'Tab privacy state is not confirmed normal'
+      });
+      return false;
+    }
+
     getBackgroundPersonality().recordSiteVisit(message.category, message.sentiment).catch(e => {
       console.warn('[Arcrawls Background] Failed to record site visit:', e);
     });
@@ -241,7 +344,11 @@ extensionApi.runtime.onMessage?.addListener((message, sender, sendResponse) => {
 
   if (message.type === 'get-tab-http-error') {
     const tabId = sender.tab?.id;
-    const errorCode = tabId ? tabHttpErrors[tabId] : undefined;
+
+    const errorCode = isTabConfirmedNormal(tabId) && tabId !== undefined
+      ? tabHttpErrors[tabId]
+      : undefined;
+
     sendResponse({ errorCode });
     return false;
   }
@@ -355,6 +462,11 @@ extensionApi.runtime.onMessage?.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === 'get-origin-pet-state') {
+    if (!isTabConfirmedNormal(sender.tab?.id)) {
+      sendResponse(null);
+      return false;
+    }
+
     const hostname = message.hostname;
     if (hostname && originPetStates[hostname]) {
       sendResponse(originPetStates[hostname]);
@@ -365,6 +477,14 @@ extensionApi.runtime.onMessage?.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === 'update-origin-pet-state') {
+    if (!isTabConfirmedNormal(sender.tab?.id)) {
+      sendResponse({
+        success: false,
+        error: 'Tab privacy state is not confirmed normal'
+      });
+      return false;
+    }
+
     const { hostname, emotion, dialogue } = message;
     if (hostname) {
       const newState: OriginPetState = {
@@ -395,7 +515,13 @@ extensionApi.runtime.onMessage?.addListener((message, sender, sendResponse) => {
           if (tab.url) {
             try {
               const tabHostname = new URL(tab.url).hostname;
-              if (tabHostname === hostname && sender.tab && tab.id !== sender.tab.id && tab.id !== undefined) {
+              if (
+                tabHostname === hostname &&
+                sender.tab &&
+                tab.id !== sender.tab.id &&
+                tab.id !== undefined &&
+                isTabConfirmedNormal(tab.id)
+              ) {
                 extensionApi.tabs.sendMessage(tab.id, {
                   type: 'sync-origin-pet-state',
                   state: newState
@@ -446,6 +572,16 @@ extensionApi.runtime.onMessage?.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === 'get-local-ai-emotion') {
+    const privacyTabId = sender.tab?.id;
+
+    if (!isTabConfirmedNormal(privacyTabId)) {
+      sendResponse({
+        success: false,
+        error: 'Tab privacy state is not confirmed normal'
+      });
+      return false;
+    }
+
     if (!supportsOffscreen) {
       sendResponse({ success: false, error: unsupportedOffscreenMessage });
       return false;

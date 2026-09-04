@@ -147,6 +147,36 @@ function refreshPrivacyState(): PagePrivacyDecision {
   return decision;
 }
 
+async function reportPrivacyStateToBackground(
+  state: 'normal' | 'protected',
+  reason: PagePrivacyDecision['reason']
+): Promise<boolean> {
+  if (isOrphaned || !privacyConsentAccepted) {
+    return false;
+  }
+
+  try {
+    const response = await extensionApi.runtime.sendMessage<{
+      success?: boolean;
+    }>({
+      type: 'privacy-state',
+      state,
+      reason
+    });
+
+    return response?.success === true;
+  } catch (e: any) {
+    if (
+      e?.message &&
+      e.message.includes('context invalidated')
+    ) {
+      cleanupOrphanedScript();
+    }
+
+    return false;
+  }
+}
+
 function isNormalRuntimeActive(): boolean {
   return (
     isInitialized &&
@@ -212,6 +242,11 @@ function lockNormalRuntimeForPrivacy(
   isPrivacyProtected = true;
   isPrivacyLocked = true;
   privacyProtectionReason = reason;
+
+  void reportPrivacyStateToBackground(
+    'protected',
+    reason
+  );
 
   stopPrivacyObserver();
   clearNormalRuntimeTimers();
@@ -1631,6 +1666,80 @@ extensionApi.runtime.onMessage?.addListener((msg, sender, sendResponse) => {
   return false;
 });
 
+async function handlePrivacyNavigation(): Promise<void> {
+  if (!checkContextOrCleanup()) return;
+  if (!privacyConsentAccepted) return;
+
+  if (isPrivacyLocked) {
+    await reportPrivacyStateToBackground(
+      'protected',
+      privacyProtectionReason
+    );
+    return;
+  }
+
+  const privacyDecision = enforceCurrentPagePrivacy();
+
+  if (privacyDecision.protected) {
+    await reportPrivacyStateToBackground(
+      'protected',
+      privacyDecision.reason
+    );
+    return;
+  }
+
+  // A full navigation may notify the content script while the DOM
+  // is still being assembled. Do not declare NORMAL until the
+  // DOMContentLoaded preflight has had a chance to inspect forms.
+  if (document.readyState === 'loading') {
+    return;
+  }
+
+  const privacyReported = await reportPrivacyStateToBackground(
+    'normal',
+    privacyDecision.reason
+  );
+
+  if (
+    !privacyReported ||
+    isOrphaned ||
+    isPrivacyLocked
+  ) {
+    return;
+  }
+
+  // Fail closed if the DOM became sensitive while awaiting
+  // the service-worker acknowledgement.
+  const postReportDecision = enforceCurrentPagePrivacy();
+
+  if (postReportDecision.protected) {
+    await reportPrivacyStateToBackground(
+      'protected',
+      postReportDecision.reason
+    );
+    return;
+  }
+
+  if (!isInitialized) {
+    if (
+      privacyConsentAccepted &&
+      document.visibilityState === 'visible'
+    ) {
+      startPrivacyObserver();
+      void actuallyInit();
+    }
+
+    return;
+  }
+
+  triggers.clearHttpError();
+  triggers.clearConsoleError();
+  hasEvaluatedPageAi = false;
+  currentAiCategory = undefined;
+  currentAiSentiment = undefined;
+  updateEmotion();
+}
+
 function handleRuntimeMessage(message: PetMessage, sender: chrome.runtime.MessageSender, sendResponse: (response?: any) => void) {
   if (!checkContextOrCleanup()) return;
 
@@ -1653,34 +1762,7 @@ function handleRuntimeMessage(message: PetMessage, sender: chrome.runtime.Messag
   }
 
   if (message.type === 'navigation') {
-    if (isPrivacyLocked) return false;
-
-    const privacyDecision = enforceCurrentPagePrivacy();
-
-    if (privacyDecision.protected) {
-      return false;
-    }
-
-    if (!isInitialized) {
-      if (
-        privacyConsentAccepted &&
-        document.readyState !== 'loading' &&
-        document.visibilityState === 'visible'
-      ) {
-        startPrivacyObserver();
-        void actuallyInit();
-      }
-
-      return false;
-    }
-
-    triggers.clearHttpError();
-    triggers.clearConsoleError();
-    hasEvaluatedPageAi = false;
-    currentAiCategory = undefined;
-    currentAiSentiment = undefined;
-    updateEmotion();
-
+    void handlePrivacyNavigation();
     return false;
   }
 
@@ -1821,7 +1903,14 @@ function handlePrivacyDomReady(): void {
   startPrivacyObserver();
 
   const decision = enforceCurrentPagePrivacy();
-  if (decision.protected) return;
+
+  if (decision.protected) {
+    void reportPrivacyStateToBackground(
+      'protected',
+      decision.reason
+    );
+    return;
+  }
 
   if (
     !isInitialized &&
@@ -1872,8 +1961,38 @@ async function actuallyInit(): Promise<void> {
   const privacyDecision = enforceCurrentPagePrivacy();
 
   if (privacyDecision.protected) {
+    void reportPrivacyStateToBackground(
+      'protected',
+      privacyDecision.reason
+    );
+
     console.log(
       `[${currentSettings.name || "Arcrawls"} Content] Privacy protection active (${privacyDecision.reason}). Normal runtime disabled for this page.`
+    );
+    return;
+  }
+
+  const privacyReported = await reportPrivacyStateToBackground(
+    'normal',
+    privacyDecision.reason
+  );
+
+  if (
+    !privacyReported ||
+    isOrphaned ||
+    isPrivacyLocked
+  ) {
+    return;
+  }
+
+  // The DOM may have changed while the background acknowledgement
+  // was pending. Re-check before starting any normal runtime.
+  const postReportDecision = enforceCurrentPagePrivacy();
+
+  if (postReportDecision.protected) {
+    void reportPrivacyStateToBackground(
+      'protected',
+      postReportDecision.reason
     );
     return;
   }

@@ -180,6 +180,9 @@ export const extensionApi = {
     },
     get onCommitted() {
       return getExtensionRoot()?.webNavigation?.onCommitted;
+    },
+    get onHistoryStateUpdated() {
+      return getExtensionRoot()?.webNavigation?.onHistoryStateUpdated;
     }
   },
   offscreen: {
