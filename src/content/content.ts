@@ -14,6 +14,11 @@ import { isFocusActive, isSleeping } from '../core/schedule';
 import { extensionApi, getRuntimeUrl } from '../shared/platform';
 import { speech } from '../shared/speech-i18n';
 import { applyForcedLocaleViaMessage } from '../shared/locale';
+import {
+  evaluateUrlPrivacy,
+  hasSensitiveFormFields,
+  type PagePrivacyDecision
+} from '../core/privacy';
 
 const BRIDGE_TOKEN = Math.random().toString(36).substring(2) + Date.now().toString(36);
 setBridgeToken(BRIDGE_TOKEN);
@@ -28,7 +33,14 @@ function injectMainWorld(): void {
     const script = document.createElement('script');
     script.src = getRuntimeUrl('main_world.js');
     script.dataset.token = BRIDGE_TOKEN;
-    script.onload = () => script.remove();
+    script.onload = () => {
+      script.remove();
+
+      // Privacy may have activated while the MAIN-world file was loading.
+      if (isPrivacyLocked || isPrivacyProtected) {
+        shutdownMainWorldBridge();
+      }
+    };
     (document.head || document.documentElement).appendChild(script);
   } catch (e) {
     console.warn(`[${currentSettings.name || "Arcrawls"} Content] Main world injection failed:`, e);
@@ -41,6 +53,8 @@ let pokeInterval: ReturnType<typeof setInterval> | null = null;
 let cachedAiAvailability: 'readily' | 'after-download' | 'no' | null = null;
 
 async function playSound(type: string): Promise<void> {
+  if (!isNormalRuntimeActive()) return;
+
   const sounds: Record<string, string> = {
     greeting: 'sounds/greeting.mp3',
     levelUp: 'sounds/level-up.mp3',
@@ -95,6 +109,277 @@ async function playSound(type: string): Promise<void> {
 
 let isOrphaned = false;
 let privacyConsentAccepted = false;
+let isPrivacyProtected = false;
+let isPrivacyLocked = false;
+let privacyProtectionReason: PagePrivacyDecision['reason'] = 'normal';
+let privacyObserver: MutationObserver | null = null;
+let privacyMutationScheduled = false;
+
+function evaluateCurrentPagePrivacy(): PagePrivacyDecision {
+  const urlDecision = evaluateUrlPrivacy(
+    window.location.href,
+    currentSettings.blockedDomains || []
+  );
+
+  if (urlDecision.protected) {
+    return urlDecision;
+  }
+
+  if (hasSensitiveFormFields(document)) {
+    return {
+      protected: true,
+      reason: 'sensitive-form'
+    };
+  }
+
+  return {
+    protected: false,
+    reason: 'normal'
+  };
+}
+
+function refreshPrivacyState(): PagePrivacyDecision {
+  const decision = evaluateCurrentPagePrivacy();
+
+  isPrivacyProtected = decision.protected;
+  privacyProtectionReason = decision.reason;
+
+  return decision;
+}
+
+async function reportPrivacyStateToBackground(
+  state: 'normal' | 'protected',
+  reason: PagePrivacyDecision['reason']
+): Promise<boolean> {
+  if (isOrphaned || !privacyConsentAccepted) {
+    return false;
+  }
+
+  try {
+    const response = await extensionApi.runtime.sendMessage<{
+      success?: boolean;
+    }>({
+      type: 'privacy-state',
+      state,
+      reason
+    });
+
+    return response?.success === true;
+  } catch (e: any) {
+    if (
+      e?.message &&
+      e.message.includes('context invalidated')
+    ) {
+      cleanupOrphanedScript();
+    }
+
+    return false;
+  }
+}
+
+function isNormalRuntimeActive(): boolean {
+  return (
+    isInitialized &&
+    !isOrphaned &&
+    !isPrivacyLocked &&
+    !isPrivacyProtected
+  );
+}
+
+function shutdownMainWorldBridge(): void {
+  try {
+    window.postMessage(
+      {
+        type: 'PET_BRIDGE_SHUTDOWN',
+        token: BRIDGE_TOKEN
+      },
+      '*'
+    );
+  } catch {
+    // Ignore bridge shutdown failures during privacy teardown.
+  }
+}
+
+function stopPrivacyObserver(): void {
+  privacyObserver?.disconnect();
+  privacyObserver = null;
+  privacyMutationScheduled = false;
+}
+
+function clearNormalRuntimeTimers(): void {
+  if (idleTimer) {
+    clearTimeout(idleTimer);
+    idleTimer = null;
+  }
+
+  if (debounceTimeout) {
+    clearTimeout(debounceTimeout);
+    debounceTimeout = null;
+  }
+
+  if (pokeInterval) {
+    clearInterval(pokeInterval);
+    pokeInterval = null;
+  }
+
+  if (interactionTimeout) {
+    clearTimeout(interactionTimeout);
+    interactionTimeout = null;
+  }
+
+  if (ghostModeTimeout) {
+    clearTimeout(ghostModeTimeout);
+    ghostModeTimeout = null;
+  }
+}
+
+function lockNormalRuntimeForPrivacy(
+  reason: PagePrivacyDecision['reason']
+): void {
+  if (isPrivacyLocked) return;
+
+  // Set the lock before cleanup so stale async callbacks fail closed.
+  isPrivacyProtected = true;
+  isPrivacyLocked = true;
+  privacyProtectionReason = reason;
+
+  void reportPrivacyStateToBackground(
+    'protected',
+    reason
+  );
+
+  stopPrivacyObserver();
+  clearNormalRuntimeTimers();
+  shutdownMainWorldBridge();
+
+  try {
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+      (window as any).__currentUtterance = null;
+    }
+  } catch {
+    // Ignore speech teardown failures.
+  }
+
+  if (isInitialized) {
+    try {
+      movement.stop();
+    } catch {
+      // Ignore teardown failures.
+    }
+
+    try {
+      triggers.cleanup();
+    } catch {
+      // Ignore teardown failures.
+    }
+
+    try {
+      personality.destroy();
+    } catch {
+      // Ignore teardown failures.
+    }
+
+    try {
+      view.destroy();
+    } catch {
+      // Ignore teardown failures.
+    }
+  }
+
+  window.removeEventListener('dragover', handleDragOver);
+  window.removeEventListener('drop', handleDrop);
+  window.removeEventListener('pet-console-error', handleConsoleError);
+  window.removeEventListener('keydown', handleKeydown);
+  document.removeEventListener('keydown', handleGhostModeActivity);
+  document.removeEventListener('scroll', handleGhostModeActivity);
+
+  isInitialized = false;
+  isCurrentlyHidden = true;
+  isTemporarilyInteracting = false;
+  hasEvaluatedPageAi = false;
+  currentAiCategory = undefined;
+  currentAiSentiment = undefined;
+
+  console.log(
+    `[${currentSettings.name || "Arcrawls"} Content] Privacy lock activated (${reason}). Normal runtime will remain disabled until this document is replaced.`
+  );
+}
+
+function enforceCurrentPagePrivacy(): PagePrivacyDecision {
+  if (isPrivacyLocked) {
+    return {
+      protected: true,
+      reason: privacyProtectionReason
+    };
+  }
+
+  const decision = refreshPrivacyState();
+
+  if (decision.protected && isInitialized) {
+    lockNormalRuntimeForPrivacy(decision.reason);
+  }
+
+  return decision;
+}
+
+function schedulePrivacyRecheck(): void {
+  if (
+    isPrivacyLocked ||
+    isOrphaned ||
+    privacyMutationScheduled
+  ) {
+    return;
+  }
+
+  privacyMutationScheduled = true;
+
+  queueMicrotask(() => {
+    privacyMutationScheduled = false;
+
+    if (isPrivacyLocked || isOrphaned) return;
+
+    const decision = enforceCurrentPagePrivacy();
+
+    if (decision.protected) return;
+
+    if (
+      !isInitialized &&
+      privacyConsentAccepted &&
+      document.readyState !== 'loading' &&
+      document.visibilityState === 'visible'
+    ) {
+      void actuallyInit();
+    }
+  });
+}
+
+function startPrivacyObserver(): void {
+  if (
+    privacyObserver ||
+    isPrivacyLocked ||
+    isOrphaned ||
+    !document.documentElement
+  ) {
+    return;
+  }
+
+  privacyObserver = new MutationObserver(() => {
+    schedulePrivacyRecheck();
+  });
+
+  privacyObserver.observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: [
+      'type',
+      'autocomplete',
+      'name',
+      'id'
+    ]
+  });
+}
 
 async function readPrivacyConsent(): Promise<boolean> {
   try {
@@ -109,6 +394,8 @@ async function readPrivacyConsent(): Promise<boolean> {
 function cleanupOrphanedScript(reason = "Browser Pet: Old extension context invalidated. Injected mascot cleaned up."): void {
   if (isOrphaned) return;
   isOrphaned = true;
+
+  stopPrivacyObserver();
 
   if (idleTimer) clearTimeout(idleTimer);
   if (debounceTimeout) clearTimeout(debounceTimeout);
@@ -136,6 +423,7 @@ function cleanupOrphanedScript(reason = "Browser Pet: Old extension context inva
 
   window.removeEventListener('dragover', handleDragOver);
   window.removeEventListener('drop', handleDrop);
+  document.removeEventListener('DOMContentLoaded', handlePrivacyDomReady);
   document.removeEventListener('visibilitychange', handleVisibilityChange);
   window.removeEventListener('focus', handleWindowFocus);
   window.removeEventListener('pet-console-error', handleConsoleError);
@@ -167,6 +455,7 @@ function safeSendMessage(message: PetMessage, callback?: (response: any) => void
   try {
     if (!checkContextOrCleanup()) return;
     extensionApi.runtime.sendMessage(message).then((response) => {
+      if (isPrivacyLocked || isOrphaned) return;
       if (callback) callback(response);
     }).catch((e: any) => {
       if (e.message && e.message.includes('context invalidated')) {
@@ -212,7 +501,16 @@ function setSessionItem(key: string, value: string): void {
 }
 
 function getSemanticPageText(): string {
-  if (isPetHidden()) return ''; // Domain blocklist check
+  const privacyDecision = enforceCurrentPagePrivacy();
+
+  if (
+    privacyDecision.protected ||
+    !isNormalRuntimeActive()
+  ) {
+    return '';
+  }
+
+  if (isPetHidden()) return '';
 
   // Prioritize actual content over navigation/footers
   const rootElement = document.querySelector('main, article, [role="main"], #content') as HTMLElement || document.body;
@@ -241,7 +539,13 @@ function getSemanticPageText(): string {
 function isPetHidden(): boolean {
   const isBlockedDomain = currentSettings.blockedDomains?.includes(window.location.hostname);
   const isHiddenInTab = getSessionItem('pet-hidden-in-tab') === 'true';
-  return !!(isBlockedDomain || isHiddenInTab);
+
+  return !!(
+    isPrivacyLocked ||
+    isPrivacyProtected ||
+    isBlockedDomain ||
+    isHiddenInTab
+  );
 }
 
 function hidePet(): void {
@@ -254,6 +558,7 @@ function hidePet(): void {
 }
 
 function showPet(): void {
+  if (isPrivacyLocked || isPrivacyProtected) return;
   if (!isCurrentlyHidden) return;
   isCurrentlyHidden = false;
   if (!isInitialized) {
@@ -270,6 +575,8 @@ setTimeout(() => {
 }, 3000);
 
 function showBubbleWithSound(text: string, duration?: number): void {
+  if (!isNormalRuntimeActive()) return;
+
   if (document.visibilityState === 'visible' && !isPetHidden() && !isInitialPageLoad) {
     playSound('chat');
   }
@@ -282,14 +589,20 @@ function showBubbleWithSound(text: string, duration?: number): void {
 }
 
 function debouncedUpdateEmotion(delay = 500): void {
+  if (!isNormalRuntimeActive()) return;
+
   if (debounceTimeout) clearTimeout(debounceTimeout);
   debounceTimeout = setTimeout(() => {
+    if (!isNormalRuntimeActive()) return;
+
     updateEmotion();
     resetIdleTimer();
   }, delay);
 }
 
 function resetIdleTimer(): void {
+  if (!isNormalRuntimeActive()) return;
+
   if (idleTimer) {
     clearTimeout(idleTimer);
     idleTimer = null;
@@ -508,6 +821,15 @@ function ensureInitialized(): void {
   };
 
   view.onChatSubmit = async (text: string) => {
+    const privacyDecision = enforceCurrentPagePrivacy();
+
+    if (
+      privacyDecision.protected ||
+      !isNormalRuntimeActive()
+    ) {
+      return;
+    }
+
     chatHistory.push({ role: 'user', content: text });
     saveChatHistory();
     
@@ -524,6 +846,8 @@ function ensureInitialized(): void {
     
     try {
       const response = await getAiChatResponse(text, pageText, persona, statsContext, chatHistory, currentSettings.name);
+
+      if (!isNormalRuntimeActive()) return;
       
       view.setChatLoading(false);
       
@@ -564,6 +888,15 @@ function ensureInitialized(): void {
   };
 
   view.onChatRedo = async (oldMsgEl: HTMLElement, lastUserMsg: string) => {
+    const privacyDecision = enforceCurrentPagePrivacy();
+
+    if (
+      privacyDecision.protected ||
+      !isNormalRuntimeActive()
+    ) {
+      return;
+    }
+
     if (chatHistory.length > 0 && chatHistory[chatHistory.length - 1].role === 'assistant') {
       chatHistory.pop();
       saveChatHistory();
@@ -594,6 +927,8 @@ function ensureInitialized(): void {
     
     try {
       const response = await getAiChatResponse(lastUserMsg, pageText, persona, statsContext, chatHistory, currentSettings.name);
+
+      if (!isNormalRuntimeActive()) return;
       
       view.setChatLoading(false);
       
@@ -689,7 +1024,7 @@ function ensureInitialized(): void {
 }
 
 async function loadPet(name: string): Promise<void> {
-  if (!isInitialized || isOrphaned) return;
+  if (!isNormalRuntimeActive()) return;
   const assetName = getResolvedCostumeName(name, currentSettings.costume, currentSettings.seasonalEnabled);
   view.setEmotion(assetName, currentSettings.customColor);
 
@@ -714,7 +1049,11 @@ async function loadPet(name: string): Promise<void> {
 
 async function updateEmotion(): Promise<void> {
   if (!checkContextOrCleanup()) return;
-  if (!isInitialized) return;
+
+  const privacyDecision = enforceCurrentPagePrivacy();
+  if (privacyDecision.protected) return;
+
+  if (!isNormalRuntimeActive()) return;
   if (isPetHidden()) return;
   if (isTemporarilyInteracting) return;
 
@@ -768,6 +1107,7 @@ async function updateEmotion(): Promise<void> {
   let aiStatus = 'no';
   if (currentSettings.aiMode) {
     aiStatus = await checkTabAiAvailability();
+    if (!isNormalRuntimeActive()) return;
   }
   const useLiteMode = !currentSettings.aiMode || isMetered || aiStatus !== 'readily';
 
@@ -784,6 +1124,8 @@ async function updateEmotion(): Promise<void> {
 
       try {
         const storedTime = await extensionApi.storage.local.get<Record<string, any>>(STORAGE_KEYS.LAST_AI_COMMENT_TIME);
+        if (!isNormalRuntimeActive()) return;
+
         const lastCommentTime = storedTime[STORAGE_KEYS.LAST_AI_COMMENT_TIME] || 0;
         const freqSec = currentSettings.commentFrequency ?? 60;
         const now = Date.now();
@@ -791,6 +1133,7 @@ async function updateEmotion(): Promise<void> {
         if (now - lastCommentTime >= freqSec * 1000) {
           if (!checkContextOrCleanup()) return;
           await extensionApi.storage.local.set({ [STORAGE_KEYS.LAST_AI_COMMENT_TIME]: now });
+          if (!isNormalRuntimeActive()) return;
 
           const metaDesc = (document.querySelector('meta[name="description"]') as HTMLMetaElement | null)?.content;
           const pageText = getSemanticPageText();
@@ -807,6 +1150,8 @@ async function updateEmotion(): Promise<void> {
             setSessionItem('arcrawls-last-semantic-text', pageText);
             const statsContext = `Happiness: ${personality.stats.happiness}%, Energy: ${personality.stats.energy}%, Focus: ${personality.stats.focus}%, Personality Trait: ${trait}`;
             const result = await getAiEmotion(context.pageTitle, metaDesc, window.location.href, currentSettings.apiKey, currentSettings.persona || 'default', statsContext, currentSettings.sentimentSensitivity, currentSettings.name, pageText);
+            if (!isNormalRuntimeActive()) return;
+
             nextEmotion = result.emotion;
             aiComment = result.comment;
             currentAiCategory = result.category;
@@ -844,6 +1189,9 @@ async function updateEmotion(): Promise<void> {
       setSessionItem('arcrawls-lite-mode-notified', 'true');
     }
   }
+
+  if (!isNormalRuntimeActive()) return;
+
   if (nextEmotion !== emotion.current || aiComment || !view.getPetImg().src) {
     emotion.current = nextEmotion;
     loadPet(nextEmotion);
@@ -895,6 +1243,11 @@ async function updateEmotion(): Promise<void> {
 }
 
 async function triggerContextDialogue(mood: string): Promise<void> {
+  const privacyDecision = enforceCurrentPagePrivacy();
+  if (privacyDecision.protected) return;
+
+  if (!isNormalRuntimeActive()) return;
+
   if (isFocusActive(currentSettings)) {
     return;
   }
@@ -931,6 +1284,8 @@ async function triggerContextDialogue(mood: string): Promise<void> {
         currentSettings.name,
         pageText
       );
+
+      if (!isNormalRuntimeActive()) return;
       
       if (genDialogue) {
         showBubbleWithSound(genDialogue);
@@ -1214,6 +1569,8 @@ function handleStorageChanged(changes: Record<string, StorageChange>) {
     const accepted = changes[STORAGE_KEYS.CONSENT].newValue === true;
     privacyConsentAccepted = accepted;
     if (!accepted) {
+      stopPrivacyObserver();
+
       if (isInitialized) {
         cleanupOrphanedScript("Browser Pet: Privacy consent was removed. Injected mascot cleaned up.");
       }
@@ -1231,6 +1588,22 @@ function handleStorageChanged(changes: Record<string, StorageChange>) {
       if (languageChanged) {
         applyForcedLocaleViaMessage(currentSettings.language).catch(() => {});
       }
+
+      if (isPrivacyLocked) return;
+
+      const privacyDecision = enforceCurrentPagePrivacy();
+      if (privacyDecision.protected) return;
+
+      if (
+        !isInitialized &&
+        privacyConsentAccepted &&
+        document.readyState !== 'loading' &&
+        document.visibilityState === 'visible'
+      ) {
+        void actuallyInit();
+        return;
+      }
+
       if (isInitialized) {
         personality.disabledEmotions = currentSettings.disabledEmotions || [];
         movement.updateSettings({
@@ -1293,6 +1666,80 @@ extensionApi.runtime.onMessage?.addListener((msg, sender, sendResponse) => {
   return false;
 });
 
+async function handlePrivacyNavigation(): Promise<void> {
+  if (!checkContextOrCleanup()) return;
+  if (!privacyConsentAccepted) return;
+
+  if (isPrivacyLocked) {
+    await reportPrivacyStateToBackground(
+      'protected',
+      privacyProtectionReason
+    );
+    return;
+  }
+
+  const privacyDecision = enforceCurrentPagePrivacy();
+
+  if (privacyDecision.protected) {
+    await reportPrivacyStateToBackground(
+      'protected',
+      privacyDecision.reason
+    );
+    return;
+  }
+
+  // A full navigation may notify the content script while the DOM
+  // is still being assembled. Do not declare NORMAL until the
+  // DOMContentLoaded preflight has had a chance to inspect forms.
+  if (document.readyState === 'loading') {
+    return;
+  }
+
+  const privacyReported = await reportPrivacyStateToBackground(
+    'normal',
+    privacyDecision.reason
+  );
+
+  if (
+    !privacyReported ||
+    isOrphaned ||
+    isPrivacyLocked
+  ) {
+    return;
+  }
+
+  // Fail closed if the DOM became sensitive while awaiting
+  // the service-worker acknowledgement.
+  const postReportDecision = enforceCurrentPagePrivacy();
+
+  if (postReportDecision.protected) {
+    await reportPrivacyStateToBackground(
+      'protected',
+      postReportDecision.reason
+    );
+    return;
+  }
+
+  if (!isInitialized) {
+    if (
+      privacyConsentAccepted &&
+      document.visibilityState === 'visible'
+    ) {
+      startPrivacyObserver();
+      void actuallyInit();
+    }
+
+    return;
+  }
+
+  triggers.clearHttpError();
+  triggers.clearConsoleError();
+  hasEvaluatedPageAi = false;
+  currentAiCategory = undefined;
+  currentAiSentiment = undefined;
+  updateEmotion();
+}
+
 function handleRuntimeMessage(message: PetMessage, sender: chrome.runtime.MessageSender, sendResponse: (response?: any) => void) {
   if (!checkContextOrCleanup()) return;
 
@@ -1311,6 +1758,11 @@ function handleRuntimeMessage(message: PetMessage, sender: chrome.runtime.Messag
       showPet();
     }
     sendResponse({ success: true, isHidden: hide });
+    return false;
+  }
+
+  if (message.type === 'navigation') {
+    void handlePrivacyNavigation();
     return false;
   }
 
@@ -1354,15 +1806,6 @@ function handleRuntimeMessage(message: PetMessage, sender: chrome.runtime.Messag
       triggers.setHttpError(message.code);
       updateEmotion();
     }
-  } else if (message.type === 'navigation') {
-    if (isInitialized) {
-      triggers.clearHttpError();
-      triggers.clearConsoleError();
-      hasEvaluatedPageAi = false;
-      currentAiCategory = undefined;
-      currentAiSentiment = undefined;
-      updateEmotion();
-    }
   } else if (message.type === 'sync-pet-state') {
     if (isInitialized && document.visibilityState === 'visible' && !document.hasFocus() && !movement.isDragging && !currentSettings.performanceMode) {
       movement.syncState(message.state);
@@ -1395,6 +1838,7 @@ function handleRuntimeMessage(message: PetMessage, sender: chrome.runtime.Messag
 
 function handleVisibilityChange() {
   if (!checkContextOrCleanup()) return;
+  if (isPrivacyLocked) return;
   if (isPetHidden()) return;
   if (document.visibilityState === 'visible') {
     if (!isInitialized) {
@@ -1447,6 +1891,35 @@ function handleGhostModeActivity() {
   }, 2000);
 }
 
+function handlePrivacyDomReady(): void {
+  if (
+    isOrphaned ||
+    isPrivacyLocked ||
+    !privacyConsentAccepted
+  ) {
+    return;
+  }
+
+  startPrivacyObserver();
+
+  const decision = enforceCurrentPagePrivacy();
+
+  if (decision.protected) {
+    void reportPrivacyStateToBackground(
+      'protected',
+      decision.reason
+    );
+    return;
+  }
+
+  if (
+    !isInitialized &&
+    document.visibilityState === 'visible'
+  ) {
+    void actuallyInit();
+  }
+}
+
 async function init(): Promise<void> {
   await loadAndApplySettings();
 
@@ -1468,12 +1941,59 @@ async function init(): Promise<void> {
 }
 
 async function actuallyInit(): Promise<void> {
-  if (isInitialized || isOrphaned) return;
+  if (isInitialized || isOrphaned || isPrivacyLocked) return;
 
   if (!privacyConsentAccepted) {
     privacyConsentAccepted = await readPrivacyConsent();
   }
   if (!privacyConsentAccepted || isInitialized || isOrphaned) {
+    return;
+  }
+
+  // At document_start the page may not have mounted its forms yet.
+  // Wait until DOMContentLoaded before deciding that a page is safe.
+  if (document.readyState === 'loading') {
+    return;
+  }
+
+  startPrivacyObserver();
+
+  const privacyDecision = enforceCurrentPagePrivacy();
+
+  if (privacyDecision.protected) {
+    void reportPrivacyStateToBackground(
+      'protected',
+      privacyDecision.reason
+    );
+
+    console.log(
+      `[${currentSettings.name || "Arcrawls"} Content] Privacy protection active (${privacyDecision.reason}). Normal runtime disabled for this page.`
+    );
+    return;
+  }
+
+  const privacyReported = await reportPrivacyStateToBackground(
+    'normal',
+    privacyDecision.reason
+  );
+
+  if (
+    !privacyReported ||
+    isOrphaned ||
+    isPrivacyLocked
+  ) {
+    return;
+  }
+
+  // The DOM may have changed while the background acknowledgement
+  // was pending. Re-check before starting any normal runtime.
+  const postReportDecision = enforceCurrentPagePrivacy();
+
+  if (postReportDecision.protected) {
+    void reportPrivacyStateToBackground(
+      'protected',
+      postReportDecision.reason
+    );
     return;
   }
 
@@ -1485,6 +2005,7 @@ async function actuallyInit(): Promise<void> {
   await personality.isLoaded;
 
   if (!checkContextOrCleanup()) return;
+  if (!isNormalRuntimeActive()) return;
 
   view.preloadAssets();
 
@@ -1498,6 +2019,8 @@ async function actuallyInit(): Promise<void> {
       return;
     }
   }
+
+  if (!isNormalRuntimeActive()) return;
 
   window.addEventListener('pet-console-error', handleConsoleError);
 
@@ -1627,5 +2150,13 @@ async function getAiEmotionAvailability(): Promise<'readily' | 'after-download' 
 }
 
 if (document.documentElement.tagName.toLowerCase() === 'html' && window === window.top) {
+  if (document.readyState === 'loading') {
+    document.addEventListener(
+      'DOMContentLoaded',
+      handlePrivacyDomReady,
+      { once: true }
+    );
+  }
+
   init();
 }

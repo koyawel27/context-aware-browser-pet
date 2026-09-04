@@ -787,6 +787,30 @@ export class ViewManager {
   }
 
   public destroy() {
+    if (this.bubbleTimeout) {
+      clearTimeout(this.bubbleTimeout);
+      this.bubbleTimeout = null;
+    }
+
+    if (this.recognition) {
+      try {
+        this.recognition.onstart = null;
+        this.recognition.onresult = null;
+        this.recognition.onerror = null;
+        this.recognition.onend = null;
+
+        if (typeof this.recognition.abort === 'function') {
+          this.recognition.abort();
+        } else if (typeof this.recognition.stop === 'function') {
+          this.recognition.stop();
+        }
+      } catch {
+        // Ignore browser speech-recognition teardown failures.
+      }
+
+      this.isListening = false;
+    }
+
     document.removeEventListener('keydown', this.handleDocumentKeydown);
     document.removeEventListener('mousedown', this.handleDocumentMousedown);
     this.shadowHost.remove();
