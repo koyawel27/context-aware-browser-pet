@@ -35,7 +35,6 @@
  - [Seasonal & Holiday Themes](#seasonal--holiday-themes)
  - [Idle Behaviors](#idle-behaviors)
  - [Cursor Chasing](#cursor-chasing)
- - [HTTP Error Reactions](#http-error-reactions)
  - [Console Error Watcher](#console-error-watcher)
 8. [Interactive Toys](#interactive-toys)
 9. [Wardrobe, Costumes & Glow Effects](#wardrobe-costumes--glow-effects)
@@ -309,11 +308,6 @@ When you are idle (for at least 10 seconds), Arcrawls has a 15% chance every 10 
 - *"Let me see! "*
 - *"Watchu looking at? "*
 
-### HTTP Error Reactions
-
-If the website you are visiting returns a standard HTTP error code, Arcrawls displays a custom animated SVG specific to that exact error alongside a reaction bubble. 
-Supported error states include: **200, 201, 204, 301, 400, 401, 402, 403, 404, 408, 410, 418, 429, 451, 500, 502, 503, 504**.
-
 ### Smart Download & Lite Mode Fallback
 Arcrawls will notify you via a speech bubble while he's *"downloading his high-tech brain"* on the first run. If the AI model is still loading, unavailable, or the connection is metered/slow, Arcrawls automatically falls back to **Lite Mode**, using backup instincts to stay reactive.
 
@@ -585,7 +579,7 @@ If you opt into the local **AI Mood Analysis** feature:
 - **CPU Throttling:** Background state synchronization and interactions are strictly throttled. Arcrawls will not unnecessarily broadcast update events or stack overlapping animation frames, keeping CPU overhead extremely low even with dozens of tabs open.
 
 ### Permissions
-The extension requests only the minimum permissions necessary to function: settings storage (`storage`), navigation events (`webNavigation`), main-frame HTTP error observation (`webRequest`), alarms for statistics decay (`alarms`), and local AI operations (`offscreen`), alongside host permissions (`<all_urls>`) to run on web pages.
+The extension requests only the minimum permissions necessary to function: settings storage (`storage`), navigation events (`webNavigation`), alarms for statistics decay (`alarms`), and local AI and centralized audio operations (`offscreen`), alongside host permissions (`http://*/*`, `https://*/*`) to run on HTTP/HTTPS web pages.
 
 ### User Consent & Passive Gating
 In compliance with the Chrome Web Store Developer Program Policies, Arcrawls remains completely passive on your first run. The extension will not inject its mascot, monitor page content, or evaluate script diagnostics until you have reviewed the onboarding documentation and checked the privacy consent agreement box.

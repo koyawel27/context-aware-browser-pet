@@ -4,7 +4,6 @@ export class TriggerDetector {
   _lastInput: number;
   _keyCount: number;
   _keyTimer: ReturnType<typeof setTimeout> | undefined;
-  _lastError: number | null;
   _isVideo: boolean;
   _isSubmitting: boolean;
   _hasConsoleError: boolean;
@@ -19,7 +18,6 @@ export class TriggerDetector {
     this._lastInput = Date.now();
     this._keyCount = 0;
     this._keyTimer = undefined;
-    this._lastError = null;
     this._isVideo = false;
     this._isSubmitting = false;
     this._hasConsoleError = false;
@@ -44,25 +42,11 @@ export class TriggerDetector {
       isTypingHeavy: this._keyCount > 5,
       isVideoPlaying: this._isVideo,
       isFormSubmitting: this._isSubmitting,
-      lastHttpError: this._lastError,
       scrollDepth: this._scrollDepth(),
       hasConsoleError: this._hasConsoleError,
       mouseX: this._mouseX,
       isCursorActive: (Date.now() - this._lastMouseMove) < 5000,
     };
-  }
-
-  setHttpError(code: number): void {
-    this._lastError = code;
-    setTimeout(() => {
-      if (this._lastError === code) {
-        this._lastError = null;
-      }
-    }, 20_000);
-  }
-
-  clearHttpError(): void {
-    this._lastError = null;
   }
 
   clearConsoleError(): void {

@@ -1,7 +1,7 @@
 import { SharedPetState, OriginPetState } from '../shared/types';
 import { STORAGE_KEYS } from '../shared/constants';
 import { PersonalitySystem } from '../core/personality';
-import { extensionApi, supportsOffscreenDocuments, isFirefoxRuntime } from '../shared/platform';
+import { extensionApi, supportsOffscreenDocuments } from '../shared/platform';
 import { fetchLocaleCatalog } from '../shared/locale';
 
 let sharedPetState: SharedPetState = {
@@ -21,7 +21,6 @@ extensionApi.storage.local.get<Record<string, any>>(STORAGE_KEYS.SHARED_STATE).t
 }).catch((e) => { console.warn('[Arcrawls Background] storage.get shared-pet-state error:', e); });
 
 let originPetStates: Record<string, OriginPetState> = {};
-const tabHttpErrors: Record<number, number> = {};
 
 type TabPrivacyState = 'normal' | 'protected';
 
@@ -32,15 +31,10 @@ function setTabPrivacyState(
   state: TabPrivacyState
 ): void {
   tabPrivacyStates.set(tabId, state);
-
-  if (state !== 'normal') {
-    delete tabHttpErrors[tabId];
-  }
 }
 
 function markTabPrivacyUnknown(tabId: number): void {
   tabPrivacyStates.delete(tabId);
-  delete tabHttpErrors[tabId];
 }
 
 function isTabConfirmedNormal(
@@ -89,20 +83,6 @@ function getBackgroundPersonality(): PersonalitySystem {
   return backgroundPersonality;
 }
 
-function handleWebRequestCompleted(details: any): void {
-  if (
-    details.statusCode >= 400 &&
-    details.frameId === 0 &&
-    isTabConfirmedNormal(details.tabId)
-  ) {
-    tabHttpErrors[details.tabId] = details.statusCode;
-    extensionApi.tabs.sendMessage(details.tabId, {
-      type: 'http-error',
-      code: details.statusCode,
-    }).catch(() => {});
-  }
-}
-
 function handleBeforeNavigate(details: any): void {
   if (details.frameId === 0) {
     markTabPrivacyUnknown(details.tabId);
@@ -134,10 +114,6 @@ function setPageMonitoringEnabled(enabled: boolean): void {
   pageMonitoringEnabled = enabled;
 
   if (enabled) {
-    extensionApi.webRequest.onCompleted?.addListener(
-      handleWebRequestCompleted,
-      { urls: ['http://*/*', 'https://*/*'], types: ['main_frame'] }
-    );
     extensionApi.webNavigation.onBeforeNavigate?.addListener(handleBeforeNavigate);
     extensionApi.webNavigation.onCommitted?.addListener(
       handleNavigationCommitted,
@@ -150,12 +126,10 @@ function setPageMonitoringEnabled(enabled: boolean): void {
     return;
   }
 
-  extensionApi.webRequest.onCompleted?.removeListener(handleWebRequestCompleted);
   extensionApi.webNavigation.onBeforeNavigate?.removeListener(handleBeforeNavigate);
   extensionApi.webNavigation.onCommitted?.removeListener(handleNavigationCommitted);
   extensionApi.webNavigation.onHistoryStateUpdated?.removeListener(handleHistoryStateUpdated);
 
-  Object.keys(tabHttpErrors).forEach((tabId) => delete tabHttpErrors[Number(tabId)]);
   tabPrivacyStates.clear();
 }
 
@@ -206,12 +180,12 @@ extensionApi.runtime.onInstalled?.addListener((details) => {
     }).catch((e) => { console.warn('[Arcrawls Background] chrome.storage.local.set init error:', e); });
   }
 
-  // Set the survey/feedback URL that opens when the user uninstalls the extension
+  // Clear any previously registered uninstall URL (older installs may
+  // still have an upstream survey URL). No replacement destination.
   if (extensionApi.runtime.setUninstallURL) {
-    const manifest = extensionApi.runtime.getManifest();
-    const version = manifest?.version || 'unknown';
-    const browser = isFirefoxRuntime() ? 'firefox' : 'chrome';
-    extensionApi.runtime.setUninstallURL(`https://arcrawls.com/uninstall?version=${version}&browser=${browser}`);
+    extensionApi.runtime.setUninstallURL('').catch((e) => {
+      console.warn('[Arcrawls Background] Failed to clear uninstall URL:', e);
+    });
   }
 
   if (details.reason === 'install' || details.reason === 'update') {
@@ -258,7 +232,6 @@ extensionApi.alarms.onAlarm?.addListener(async (alarm) => {
 });
 
 extensionApi.tabs.onRemoved?.addListener((tabId) => {
-  delete tabHttpErrors[tabId];
   tabPrivacyStates.delete(tabId);
 });
 
@@ -339,17 +312,6 @@ extensionApi.runtime.onMessage?.addListener((message, sender, sendResponse) => {
       console.warn('[Arcrawls Background] Failed to record site visit:', e);
     });
     if (sendResponse) sendResponse({ success: true });
-    return false;
-  }
-
-  if (message.type === 'get-tab-http-error') {
-    const tabId = sender.tab?.id;
-
-    const errorCode = isTabConfirmedNormal(tabId) && tabId !== undefined
-      ? tabHttpErrors[tabId]
-      : undefined;
-
-    sendResponse({ errorCode });
     return false;
   }
 

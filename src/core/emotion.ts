@@ -48,13 +48,6 @@ export class EmotionEngine {
     seasonalEnabled: boolean = true,
     customPlanner?: any
   ): Promise<string> {
-    if (ctx.lastHttpError && ctx.lastHttpError >= 400) {
-      const errorStr = ctx.lastHttpError.toString();
-      if (ALL_EMOTIONS_POOL.includes(errorStr)) {
-        return errorStr;
-      }
-      return 'error';
-    }
     if (ctx.hasConsoleError) return 'working-debugger';
 
     // Focus Blocks Override (Manual Toggle or Scheduled Hours)

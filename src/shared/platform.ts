@@ -169,11 +169,6 @@ export const extensionApi = {
       return getExtensionRoot()?.i18n?.getUILanguage() ?? 'en';
     }
   },
-  webRequest: {
-    get onCompleted() {
-      return getExtensionRoot()?.webRequest?.onCompleted;
-    }
-  },
   webNavigation: {
     get onBeforeNavigate() {
       return getExtensionRoot()?.webNavigation?.onBeforeNavigate;
