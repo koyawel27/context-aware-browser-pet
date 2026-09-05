@@ -7,6 +7,7 @@ import { PetSettings, SharedPetState, PetMessage, StorageChange } from '../share
 import { springAnimate, keyframeAnimate } from '../ui/animate';
 import { PERSONA_AUTONOMOUS_DIALOGUES } from '../core/dialogues';
 import { ViewManager } from '../ui/view';
+import { PrivacyCompanion } from '../ui/privacy-companion';
 import { STORAGE_KEYS } from '../shared/constants';
 import { getDominantTrait, detectPageCategory } from '../core/rules';
 import { getResolvedCostumeName } from '../ui/shared-ui';
@@ -301,9 +302,61 @@ function lockNormalRuntimeForPrivacy(
   currentAiCategory = undefined;
   currentAiSentiment = undefined;
 
+  // Render only AFTER the normal-runtime teardown above completes.
+  showPrivacyReaction(reason);
+
   console.log(
     `[${currentSettings.name || "Arcrawls"} Content] Privacy lock activated (${reason}). Normal runtime will remain disabled until this document is replaced.`
   );
+}
+
+let privacyCompanion: PrivacyCompanion | null = null;
+let privacyReactionShown = false;
+
+function isPrivacyReactionReason(
+  reason: PagePrivacyDecision['reason']
+): boolean {
+  return (
+    reason === 'sensitive-domain' ||
+    reason === 'sensitive-route' ||
+    reason === 'sensitive-form'
+  );
+}
+
+function showPrivacyReaction(
+  reason: PagePrivacyDecision['reason']
+): void {
+  // Eligibility first: an explicit user-block transition must
+  // remove an active reaction even after the one-shot latch set.
+  if (!isPrivacyReactionReason(reason)) {
+    destroyPrivacyReaction();
+    return;
+  }
+  // One-shot per document: never replay once shown.
+  if (privacyReactionShown) return;
+  if (!privacyConsentAccepted) return;
+  if (isOrphaned) return;
+  if (window !== window.top) return;
+  // If the page is backgrounded the reaction would finish unseen.
+  // Skipping is acceptable for v1; do not monitor to replay later.
+  if (document.visibilityState !== 'visible') return;
+  if (!checkContextOrCleanup()) return;
+
+  if (!privacyCompanion) {
+    privacyCompanion = new PrivacyCompanion();
+  }
+  privacyCompanion.show(currentSettings.size || 128);
+  if (privacyCompanion.isShown()) {
+    privacyReactionShown = true;
+  }
+}
+
+function destroyPrivacyReaction(): void {
+  try {
+    privacyCompanion?.destroy();
+  } catch {
+    // Ignore privacy-companion teardown failures.
+  }
 }
 
 function enforceCurrentPagePrivacy(): PagePrivacyDecision {
@@ -341,7 +394,10 @@ function schedulePrivacyRecheck(): void {
 
     const decision = enforceCurrentPagePrivacy();
 
-    if (decision.protected) return;
+    if (decision.protected) {
+      showPrivacyReaction(decision.reason);
+      return;
+    }
 
     if (
       !isInitialized &&
@@ -349,6 +405,9 @@ function schedulePrivacyRecheck(): void {
       document.readyState !== 'loading' &&
       document.visibilityState === 'visible'
     ) {
+      // An initially protected document may have become safe while
+      // the reaction was still visible. Remove it before init.
+      destroyPrivacyReaction();
       void actuallyInit();
     }
   });
@@ -396,6 +455,7 @@ function cleanupOrphanedScript(reason = "Browser Pet: Old extension context inva
   isOrphaned = true;
 
   stopPrivacyObserver();
+  destroyPrivacyReaction();
 
   if (idleTimer) clearTimeout(idleTimer);
   if (debounceTimeout) clearTimeout(debounceTimeout);
@@ -1570,6 +1630,7 @@ function handleStorageChanged(changes: Record<string, StorageChange>) {
     privacyConsentAccepted = accepted;
     if (!accepted) {
       stopPrivacyObserver();
+      destroyPrivacyReaction();
 
       if (isInitialized) {
         cleanupOrphanedScript("Browser Pet: Privacy consent was removed. Injected mascot cleaned up.");
@@ -1589,10 +1650,25 @@ function handleStorageChanged(changes: Record<string, StorageChange>) {
         applyForcedLocaleViaMessage(currentSettings.language).catch(() => {});
       }
 
+      // A locked document never re-evaluates, but an explicit
+      // user-block must still clear a visible reaction immediately.
+      // Lock, latch, and reason stay untouched.
+      const currentUrlDecision = evaluateUrlPrivacy(
+        window.location.href,
+        currentSettings.blockedDomains || []
+      );
+
+      if (currentUrlDecision.reason === 'user-blocked') {
+        destroyPrivacyReaction();
+      }
+
       if (isPrivacyLocked) return;
 
       const privacyDecision = enforceCurrentPagePrivacy();
-      if (privacyDecision.protected) return;
+      if (privacyDecision.protected) {
+        showPrivacyReaction(privacyDecision.reason);
+        return;
+      }
 
       if (
         !isInitialized &&
@@ -1681,6 +1757,7 @@ async function handlePrivacyNavigation(): Promise<void> {
   const privacyDecision = enforceCurrentPagePrivacy();
 
   if (privacyDecision.protected) {
+    showPrivacyReaction(privacyDecision.reason);
     await reportPrivacyStateToBackground(
       'protected',
       privacyDecision.reason
@@ -1713,6 +1790,7 @@ async function handlePrivacyNavigation(): Promise<void> {
   const postReportDecision = enforceCurrentPagePrivacy();
 
   if (postReportDecision.protected) {
+    showPrivacyReaction(postReportDecision.reason);
     await reportPrivacyStateToBackground(
       'protected',
       postReportDecision.reason
@@ -1725,6 +1803,9 @@ async function handlePrivacyNavigation(): Promise<void> {
       privacyConsentAccepted &&
       document.visibilityState === 'visible'
     ) {
+      // A non-locked document may be arriving from a protected SPA
+      // state with the reaction still visible. Clear it first.
+      destroyPrivacyReaction();
       startPrivacyObserver();
       void actuallyInit();
     }
@@ -1905,6 +1986,7 @@ function handlePrivacyDomReady(): void {
   const decision = enforceCurrentPagePrivacy();
 
   if (decision.protected) {
+    showPrivacyReaction(decision.reason);
     void reportPrivacyStateToBackground(
       'protected',
       decision.reason
@@ -1961,6 +2043,7 @@ async function actuallyInit(): Promise<void> {
   const privacyDecision = enforceCurrentPagePrivacy();
 
   if (privacyDecision.protected) {
+    showPrivacyReaction(privacyDecision.reason);
     void reportPrivacyStateToBackground(
       'protected',
       privacyDecision.reason
@@ -1990,6 +2073,7 @@ async function actuallyInit(): Promise<void> {
   const postReportDecision = enforceCurrentPagePrivacy();
 
   if (postReportDecision.protected) {
+    showPrivacyReaction(postReportDecision.reason);
     void reportPrivacyStateToBackground(
       'protected',
       postReportDecision.reason
@@ -1997,6 +2081,9 @@ async function actuallyInit(): Promise<void> {
     return;
   }
 
+  // Backstop for lifecycle 1/6: an initially protected document that
+  // became safe must not keep a stale reaction under normal runtime.
+  destroyPrivacyReaction();
   injectMainWorld();
   ensureInitialized();
   window.addEventListener('dragover', handleDragOver);
