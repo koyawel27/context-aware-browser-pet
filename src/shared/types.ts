@@ -101,7 +101,6 @@ export interface TriggerSnapshot {
   isTypingHeavy: boolean;
   isVideoPlaying: boolean;
   isFormSubmitting: boolean;
-  lastHttpError: number | null;
   scrollDepth: number;
   hasConsoleError: boolean;
   mouseX: number;
