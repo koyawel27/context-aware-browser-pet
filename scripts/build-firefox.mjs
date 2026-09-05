@@ -12,7 +12,7 @@ if (manifest.permissions) {
 }
 
 if (manifest.content_security_policy && manifest.content_security_policy.extension_pages) {
-  manifest.content_security_policy.extension_pages = "script-src 'self'; object-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https://storage.ko-fi.com";
+  manifest.content_security_policy.extension_pages = "script-src 'self'; object-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:";
 }
 
 delete manifest.cross_origin_embedder_policy;

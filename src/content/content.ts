@@ -1178,7 +1178,7 @@ async function updateEmotion(): Promise<void> {
     }
   } else if (focusActive) {
     nextEmotion = await emotion.evaluate(context, scheduleEnabled, currentSettings.seasonalEnabled !== false, currentSettings);
-  } else if (scheduleEnabled && currentSettings.aiMode && !useLiteMode && !context.lastHttpError && context.idleSeconds < 60) {
+  } else if (scheduleEnabled && currentSettings.aiMode && !useLiteMode && context.idleSeconds < 60) {
     if (!hasEvaluatedPageAi) {
       if (!checkContextOrCleanup()) return;
 
@@ -1813,7 +1813,6 @@ async function handlePrivacyNavigation(): Promise<void> {
     return;
   }
 
-  triggers.clearHttpError();
   triggers.clearConsoleError();
   hasEvaluatedPageAi = false;
   currentAiCategory = undefined;
@@ -1880,12 +1879,6 @@ function handleRuntimeMessage(message: PetMessage, sender: chrome.runtime.Messag
 
       showBubbleWithSound(speech("Running away! 🏃‍♂️"));
       playSound('shoo');
-    }
-  }
-  else if (message.type === 'http-error') {
-    if (isInitialized) {
-      triggers.setHttpError(message.code);
-      updateEmotion();
     }
   } else if (message.type === 'sync-pet-state') {
     if (isInitialized && document.visibilityState === 'visible' && !document.hasFocus() && !movement.isDragging && !currentSettings.performanceMode) {
@@ -2133,13 +2126,7 @@ async function actuallyInit(): Promise<void> {
       }
     }
 
-    safeSendMessage({ type: 'get-tab-http-error' }, (response: { errorCode?: number } | undefined) => {
-      if (isOrphaned) return;
-      if (response && response.errorCode) {
-        triggers.setHttpError(response.errorCode);
-      }
-
-      safeSendMessage({ type: 'get-pet-state' }, (sharedState: SharedPetState | undefined) => {
+    safeSendMessage({ type: 'get-pet-state' }, (sharedState: SharedPetState | undefined) => {
         if (isOrphaned) return;
         if (sharedState && sharedState.y !== undefined) {
           movement.syncState(sharedState);
@@ -2183,7 +2170,6 @@ async function actuallyInit(): Promise<void> {
         }
       });
     });
-  });
 
   // Initial check
   updateEmotion();
